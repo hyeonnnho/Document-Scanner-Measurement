@@ -1,65 +1,118 @@
 import cv2
 import numpy as np
 
-# 1. 설정값
+###################################
 widthImg = 640
 heightImg = 480
+###################################
+
 cap = cv2.VideoCapture(0)
 cap.set(3, widthImg)
 cap.set(4, heightImg)
 cap.set(10, 150)
 
-# --- [핵심 함수: 가장 큰 사각형 찾기] ---
+# 트랙바 설정 (이전 설정값 기억해서 수정하셔도 됩니다)
+def empty(a): pass
+cv2.namedWindow("Parameters")
+cv2.resizeWindow("Parameters", 640, 240)
+cv2.createTrackbar("Threshold1", "Parameters", 100, 255, empty) # 추천: 80~120
+cv2.createTrackbar("Threshold2", "Parameters", 200, 255, empty) # 추천: 200~255
+cv2.createTrackbar("Area", "Parameters", 5000, 30000, empty)
+
+# --- [함수 1: 윤곽선 찾기] ---
 def getContours(img):
-    # 가장 큰 사각형의 꼭짓점(4개)을 저장할 변수
     biggest = np.array([])
     maxArea = 0
+    minArea = cv2.getTrackbarPos("Area", "Parameters")
     
-    # 외곽선(Contours) 찾기
-    # RETR_EXTERNAL: 바깥쪽 외곽선만 찾음 (내부 구멍은 무시)
-    # CHAIN_APPROX_NONE: 모든 점의 좌표를 저장
     contours, hierarchy = cv2.findContours(img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    
     for cnt in contours:
-        area = cv2.contourArea(cnt) # 면적 계산
-        
-        if area > 5000: # 너무 작은 노이즈(면적 5000 미만)는 무시
-            # 둘레(Perimeter) 길이 계산
+        area = cv2.contourArea(cnt)
+        if area > minArea:
             peri = cv2.arcLength(cnt, True)
-            
-            # ★ 다각형 근사 (Douglas-Peucker 알고리즘)
-            # 0.02 * peri: 오차 허용 범위(epsilon). 둘레의 2% 오차범위 내에서 직선으로 근사
             approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-            
-            # 꼭짓점이 4개이고(사각형), 현재까지 찾은 것 중 가장 넓다면?
             if area > maxArea and len(approx) == 4:
                 biggest = approx
                 maxArea = area
-    
-    # 찾은 가장 큰 사각형의 꼭짓점 좌표 반환, 없으면 빈 배열 반환
+                
+    # 결과: (4, 1, 2) 형태의 배열 [[x,y], [x,y], [x,y], [x,y]]
     return biggest
+
+# --- [함수 2: 점 재정렬 (Linear Algebra)] ---
+def reorder(myPoints):
+    # myPoints의 형태를 (4, 1, 2) -> (4, 2)로 단순화
+    myPoints = myPoints.reshape((4, 2))
+    myPointsNew = np.zeros((4, 1, 2), np.int32)
+    
+    # 1. 덧셈 (Sum) -> TL, BR 찾기
+    add = myPoints.sum(1) # axis=1 (x+y)
+    myPointsNew[0] = myPoints[np.argmin(add)] # 합이 최소 -> Top-Left
+    myPointsNew[3] = myPoints[np.argmax(add)] # 합이 최대 -> Bottom-Right
+    
+    # 2. 뺄셈 (Diff) -> TR, BL 찾기
+    diff = np.diff(myPoints, axis=1) # (y-x) or (x-y)
+    myPointsNew[1] = myPoints[np.argmin(diff)] # 차이가 최소(음수최대) -> Top-Right
+    myPointsNew[2] = myPoints[np.argmax(diff)] # 차이가 최대 -> Bottom-Left
+    
+    return myPointsNew
+
+# --- [함수 3: 투영 변환 (Perspective Transform)] ---
+def getWarp(img, biggest):
+    # 1. 점 정렬
+    biggest = reorder(biggest)
+    
+    # 2. 변환할 4개의 점 (Source)
+    pts1 = np.float32(biggest)
+    
+    # 3. 변환될 위치의 4개의 점 (Destination) -> 꽉 찬 직사각형
+    pts2 = np.float32([[0, 0], [widthImg, 0], [0, heightImg], [widthImg, heightImg]])
+    
+    # 4. 변환 행렬(Matrix) 계산 (3x3 행렬)
+    matrix = cv2.getPerspectiveTransform(pts1, pts2)
+    
+    # 5. 이미지 변환 적용
+    imgOutput = cv2.warpPerspective(img, matrix, (widthImg, heightImg))
+    
+    # 자른 이미지에서 가장자리의 노이즈를 살짝 잘라냄 (Crop) - 5% 정도
+    imgCropped = imgOutput[20:imgOutput.shape[0]-20, 20:imgOutput.shape[1]-20]
+    imgCropped = cv2.resize(imgCropped, (widthImg, heightImg))
+    
+    return imgCropped
 
 while True:
     success, img = cap.read()
-    img = cv2.resize(img, (widthImg, heightImg)) # 크기 고정
-    imgContour = img.copy() # 결과를 그릴 복사본 이미지
+    if not success: break
+    img = cv2.resize(img, (widthImg, heightImg))
+    imgContour = img.copy()
     
-    # [전처리]
+    # 전처리
     imgGray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     imgBlur = cv2.GaussianBlur(imgGray, (5, 5), 1)
-    imgCanny = cv2.Canny(imgBlur, 200, 200)
+    t1 = cv2.getTrackbarPos("Threshold1", "Parameters")
+    t2 = cv2.getTrackbarPos("Threshold2", "Parameters")
+    imgCanny = cv2.Canny(imgBlur, t1, t2)
+    kernel = np.ones((5, 5))
+    imgDial = cv2.dilate(imgCanny, kernel, iterations=2)
+    imgThres = cv2.erode(imgDial, kernel, iterations=1)
     
-    # [가장 큰 사각형 찾기]
-    biggest = getContours(imgCanny)
+    # 사각형 찾기
+    biggest = getContours(imgThres)
     
-    # [시각화] 찾은 사각형이 있다면 초록색 선으로 그리기
     if biggest.size != 0:
-        # drawContours: 찾은 좌표(biggest)를 이미지 위에 그림
+        # 찾았으면 윤곽선 그리고
         cv2.drawContours(imgContour, [biggest], -1, (0, 255, 0), 20)
-    
-    # 결과 출력
-    cv2.imshow("Result", imgContour)
+        
+        # ★ 투영 변환 수행!
+        imgWarped = getWarp(img, biggest)
+        
+        # 결과창에 '변환된 문서' 보여주기
+        cv2.imshow("ImageWarped", imgWarped)
+    else:
+        # 못 찾았으면 그냥 원본 보여주기 (에러 방지)
+        cv2.imshow("ImageWarped", img)
 
+    cv2.imshow("Workflow", imgContour) # 인식 과정
+    
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
